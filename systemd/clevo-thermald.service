@@ -1,0 +1,16 @@
+[Unit]
+Description=clevo-thermald — boost gating, manual fan curves and clock control for Clevo laptops
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/clevo-thermald
+# safety net: if the daemon is killed (incl. SIGKILL, where its own trap can't run),
+# hand the fans back to the EC firmware curve so they can never stay stuck low/manual
+ExecStopPost=/usr/bin/zsh /usr/local/lib/clevo-thermald/clevo-fan-direct-duty.zsh auto-all
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

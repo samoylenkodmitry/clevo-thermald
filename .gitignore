@@ -1,0 +1,21 @@
+# build artifacts / machine-specific / proprietary — never commit
+*.log
+*.ko
+*.ko.*
+.*.cmd
+*.mod
+*.mod.c
+*.mod.o
+acpi_call-*-build/
+
+# ACPI dumps (machine/firmware specific)
+*.dat
+*.dsl
+
+# decompiled / proprietary Windows artifacts (do NOT publish)
+*.il
+*.resources
+fanspeed*/
+*appxbundle*
+
+__pycache__/

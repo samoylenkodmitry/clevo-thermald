@@ -1,0 +1,318 @@
+#!/bin/bash
+#
+# clevo-thermald — quiet thermal control for Clevo laptops on Linux
+#
+# Reference hardware: Clevo NH5xAx (AMD Ryzen 9 3950X + RTX 2070). The approach
+# generalizes; retune the values below for your chip/chassis.
+#
+# Three layers:
+#   1. Dynamic CPB boost gating — boost OFF at low load (quiet idle), ON under
+#      sustained load (full speed when you actually need it).
+#   2. Manual fan curves driven through the EC (acpi_call / cmd 0x68): a quiet
+#      CPU-fan curve (smoothed k10temp) and GPU-fan curve (nvidia-smi temp), because
+#      the stock EC over-drives the fans. Reverts to EC auto on exit/crash.
+#   3. CPU P-state control — idle/light holds clocks low for silence; full speed
+#      under load; emergency cap if dangerously hot.
+#
+# Attribution: while warm it tracks which process dominates the CPU, so fan/clock
+# events name the process (with PID) responsible. All thresholds tunable below.
+# Runs as root from clevo-thermald.service.
+
+# ---- CPB boost dynamic gating (by aggregate CPU busy%) ----
+BOOST_PATH=/sys/devices/system/cpu/cpufreq/boost
+BOOST_ON_BUSY=40          # smoothed aggregate busy% sustained -> enable boost
+BOOST_ON_SECONDS=3
+BOOST_OFF_BUSY=26         # smoothed aggregate busy% sustained below -> disable boost
+BOOST_OFF_SECONDS=8
+
+# ---- manual fan curves (we own the fans; the stock EC over-drives them) ----
+# Curves map temp(C) -> duty(0-255); linear interpolation between points. Quieter than
+# the stock EC, but ramp firmly toward 100% before each chip's throttle point.
+ACPI_CALL=/proc/acpi/call
+CPU_FAN_T=(60 72 82 88 92 96)     # CPU fan vs smoothed k10temp (quieter idle, firm ramp near Tjmax)
+CPU_FAN_D=(48 76 112 165 215 255)
+GPU_FAN_T=(62 72 78 82 85 88)     # GPU fan vs nvidia-smi temp
+GPU_FAN_D=(52 88 135 180 220 255)
+CPU_FAN_EMERG=95         # raw CPU temp (C) at/above -> CPU fan 100% now
+GPU_FAN_EMERG=87         # GPU temp (C) at/above -> GPU fan 100% now
+GPU_FAIL_DUTY=200        # GPU fan duty if its temp can't be read (safe-high ~78%)
+DUTY_DELTA=8             # only rewrite the EC when a duty moves by >= this (anti-spam)
+GPU_POLL_SECS=3          # refresh GPU temp via nvidia-smi this often (0 disables GPU fan control)
+
+# ---- CPU max-clock control (load-aware, uses smoothed temp) ----
+# Idle/light -> hold clocks low for silence (never full speed when idle); full speed
+# under load. NOTE: with acpi-cpufreq only a few P-states exist; P_MAX is the highest
+# *settable* clock (boost sits above it and is gated separately, see layer 1).
+P_MAX_KHZ=$(tr ' ' '\n' < /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies | sort -rn | head -1)
+P_MID_KHZ=2800000         # mid P-state
+P_LOW_KHZ=2200000         # low P-state
+IDLE_BUSY=30              # smoothed busy% below this = idle/light -> hold clocks low for silence
+IDLE_HOT=78000            #   idle & smoothed temp >= this -> P_LOW
+IDLE_COOL=70000           #   idle & smoothed temp <= this -> back up to P_MID
+LOAD_NOTHOT=90000         #   loaded & below this -> full clocks
+LOAD_CAP_MID=96000        #   full -> P_MID
+LOAD_CAP_LOW=98000        #   P_MID -> P_LOW
+LOAD_REL_LOW=95000        #   P_LOW -> P_MID
+CAP_DWELL=3               # seconds a new target must hold before it is applied
+
+# ---- temperature smoothing & attribution ----
+SMOOTH_SAMPLES=5
+BUSY_SMOOTH=3             # smooth aggregate busy% over this many seconds for steady boost gating
+ATTRIB_WATCH_TEMP=85000   # only sample per-process culprits when smoothed temp >= this
+
+get_display_user() { who | grep '(:0)' | awk '{print $1}' | head -1; }
+
+notify() {
+    local urgency="$1" title="$2" body="$3" user uid
+    user=$(get_display_user)
+    uid=$(id -u "$user" 2>/dev/null) || return
+    runuser -l "$user" -c \
+        "DISPLAY=:0.0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus \
+         notify-send -u ${urgency} -t 8000 '${title}' '${body}'" 2>/dev/null &
+}
+
+get_max_temp() {
+    local max=0 t
+    for hwmon in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$hwmon/name" 2>/dev/null)" = "k10temp" ] || continue
+        for f in "$hwmon"/temp*_input; do
+            t=$(cat "$f" 2>/dev/null) || continue
+            [ "$t" -gt "$max" ] && max=$t
+        done
+    done
+    echo "$max"
+}
+
+get_top_procs() {
+    ps -eo comm,pid,%cpu --sort=-%cpu --no-headers 2>/dev/null \
+        | head -3 | awk '{printf "%s(%s) %.0f%%  ", $1, $2, $3}' | sed 's/  $//'
+}
+
+get_culprit() {
+    local k out
+    [ "${#culprit_count[@]}" -eq 0 ] && return
+    out=$(for k in "${!culprit_count[@]}"; do printf '%s\t%s\n' "${culprit_count[$k]}" "$k"; done \
+        | sort -rn | head -2 \
+        | while IFS=$'\t' read -r n key; do
+              printf '%s(pid %s) %ss  ' "${key%%#*}" "${key##*#}" "$n"
+          done)
+    printf '%s' "${out%  }"
+}
+
+set_max_freq() { cpupower frequency-set -u "$1" >/dev/null 2>&1; }
+
+read_cpu() {  # echoes "idle total" from /proc/stat aggregate line
+    local _l u n s idle iow irq sirq steal rest
+    read -r _l u n s idle iow irq sirq steal rest < /proc/stat
+    echo "$idle $((u + n + s + idle + iow + irq + sirq + steal))"
+}
+
+boost_on() {
+    [ "$boost_state" = "on" ] && return
+    echo 1 > "$BOOST_PATH" 2>/dev/null && boost_state="on"
+    boost_hi=0; boost_lo=0
+    logger -t clevo-thermald "CPB boost ON (busy ${busy}%, ${temp_c}C) driver: $(get_top_procs)"
+}
+
+boost_off() {
+    [ "$boost_state" = "off" ] && return
+    echo 0 > "$BOOST_PATH" 2>/dev/null && boost_state="off"
+    boost_hi=0; boost_lo=0
+    logger -t clevo-thermald "CPB boost OFF (busy ${busy}%, ${temp_c}C)"
+}
+
+# ---- fans (manual duty via EC) ----
+ensure_acpi() { [ -w "$ACPI_CALL" ] || modprobe acpi_call 2>/dev/null; }
+ec_call() { ensure_acpi; printf '%s\n' "$1" > "$ACPI_CALL" 2>/dev/null; }
+
+fans_to_auto() {  # hand all channels back to the EC firmware curve (safe state)
+    ec_call '\_SB.WMI.WMBB 0x0 0x69 0x0000000f'
+    logger -t clevo-thermald "fans returned to EC auto (manual control released)"
+}
+
+set_fan_duty() {  # $1=CPU duty, $2=GPU duty (0-255); ch3/ch4 mirror GPU (no fan there on ref hw)
+    local c="$1" g="$2" payload
+    payload=$(printf '0x%02x%02x%02x%02x' "$g" "$g" "$g" "$c")  # ch4 ch3 ch2(GPU) ch1(CPU)
+    ec_call "\\_SB.WMI.WMBB 0x0 0x68 $payload"
+}
+
+read_gpu_temp() {  # prints integer C, or empty on failure
+    nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null \
+        | head -1 | tr -dc '0-9'
+}
+
+interp() {  # $1=temp_c, $2=T-array name, $3=D-array name
+    local t="$1"; local -n T="$2"; local -n D="$3"
+    local n=${#T[@]} i
+    [ "$t" -le "${T[0]}" ] && { echo "${D[0]}"; return; }
+    [ "$t" -ge "${T[n-1]}" ] && { echo "${D[n-1]}"; return; }
+    for ((i = 1; i < n; i++)); do
+        if [ "$t" -lt "${T[i]}" ]; then
+            echo $(( D[i-1] + (D[i] - D[i-1]) * (t - T[i-1]) / (T[i] - T[i-1]) ))
+            return
+        fi
+    done
+    echo "${D[n-1]}"
+}
+
+manage_fans() {
+    local cpu_c=$((avg / 1000)) cpu_raw_c=$((temp / 1000)) cpu_d gpu_d emerg=0
+
+    # refresh GPU temp periodically (nvidia-smi is relatively expensive)
+    if [ "$GPU_POLL_SECS" -gt 0 ]; then
+        gpu_poll=$((gpu_poll + 1))
+        if [ "$gpu_poll" -ge "$GPU_POLL_SECS" ]; then
+            gpu_poll=0
+            local g; g=$(read_gpu_temp)
+            if [ -n "$g" ]; then gpu_temp="$g"; gpu_fail=0; else gpu_fail=$((gpu_fail + 1)); fi
+        fi
+    fi
+
+    cpu_d=$(interp "$cpu_c" CPU_FAN_T CPU_FAN_D)
+    if [ "$GPU_POLL_SECS" -le 0 ]; then
+        gpu_d=$cpu_d                                  # no GPU control: mirror CPU duty
+    elif [ -n "$gpu_temp" ] && [ "$gpu_fail" -lt 3 ]; then
+        gpu_d=$(interp "$gpu_temp" GPU_FAN_T GPU_FAN_D)
+    else
+        gpu_d=$GPU_FAIL_DUTY
+    fi
+
+    # emergencies (use raw/live temps, force the affected fan to 100%)
+    if [ "$cpu_raw_c" -ge "$CPU_FAN_EMERG" ]; then cpu_d=255; emerg=1; fi
+    if [ -n "$gpu_temp" ] && [ "$gpu_temp" -ge "$GPU_FAN_EMERG" ]; then gpu_d=255; emerg=1; fi
+
+    # write only on a meaningful change
+    local dc=$((cpu_d - last_cpu_d)); dc=${dc#-}
+    local dg=$((gpu_d - last_gpu_d)); dg=${dg#-}
+    if [ "$dc" -ge "$DUTY_DELTA" ] || [ "$dg" -ge "$DUTY_DELTA" ] || { [ "$emerg" = 1 ] && [ "$fan_emerg" = 0 ]; }; then
+        set_fan_duty "$cpu_d" "$gpu_d"
+        last_cpu_d=$cpu_d; last_gpu_d=$gpu_d
+        logger -t clevo-thermald "fan duty: CPU $((cpu_d * 100 / 255))% (${cpu_raw_c}C) / GPU $((gpu_d * 100 / 255))% (${gpu_temp:-?}C)"
+    fi
+
+    # one-shot emergency notification with culprit
+    if [ "$emerg" = 1 ] && [ "$fan_emerg" = 0 ]; then
+        fan_emerg=1
+        notify "critical" "Fan 100% — CPU ${cpu_raw_c}C / GPU ${gpu_temp:-?}C" "Heat source: $(get_culprit)"
+    elif [ "$emerg" = 0 ] && [ "$fan_emerg" = 1 ]; then
+        fan_emerg=0
+    fi
+}
+
+apply_cap() {  # 0=full, 1=mid, 2=low
+    local lvl="$1" khz label mode
+    case "$lvl" in
+        0) khz=$P_MAX_KHZ ;;
+        1) khz=$P_MID_KHZ ;;
+        2) khz=$P_LOW_KHZ ;;
+    esac
+    local ghz; ghz=$(awk -v k="$khz" 'BEGIN{printf "%.1f", k/1000000}')
+    if   [ "$lvl" -gt "$cap_level" ]; then label="capped to ${ghz}GHz"
+    elif [ "$lvl" -eq 0 ];            then label="restored to ${ghz}GHz"
+    else                                   label="eased to ${ghz}GHz"
+    fi
+    set_max_freq "${khz}kHz"
+    [ "$busy" -lt "$IDLE_BUSY" ] && mode="idle" || mode="load"
+    cap_level="$lvl"; cap_target="$lvl"; cap_dwell=0
+    logger -t clevo-thermald "CPU clock ${label} (${mode}, busy ${busy}%, ${temp_c}C); heat source: $(get_culprit)"
+    [ "$lvl" -ne 0 ] && notify "normal" "CPU ${label} — ${temp_c}C" "${mode} & hot; heat source: $(get_culprit)"
+}
+
+manage_cpu_cap() {
+    local want="$cap_level"
+    if [ "$busy" -lt "$IDLE_BUSY" ]; then
+        case "$cap_level" in
+            0) want=1 ;;                                 # idle -> never full; hold at P_MID
+            1) [ "$avg" -ge "$IDLE_HOT" ] && want=2 ;;   # idle & warm -> P_LOW
+            2) [ "$avg" -le "$IDLE_COOL" ] && want=1 ;;  # idle & cooled -> back to P_MID
+        esac
+    elif [ "$avg" -lt "$LOAD_NOTHOT" ]; then
+        want=0
+    else
+        case "$cap_level" in
+            0) [ "$avg" -ge "$LOAD_CAP_MID" ] && want=1 ;;
+            1) [ "$avg" -ge "$LOAD_CAP_LOW" ] && want=2 ;;
+            2) [ "$avg" -le "$LOAD_REL_LOW" ] && want=1 ;;
+        esac
+    fi
+
+    if [ "$want" -eq "$cap_level" ]; then
+        cap_target="$cap_level"; cap_dwell=0
+    else
+        [ "$want" -ne "$cap_target" ] && { cap_target="$want"; cap_dwell=0; }
+        cap_dwell=$((cap_dwell + 1))
+        [ "$cap_dwell" -ge "$CAP_DWELL" ] && apply_cap "$want"
+    fi
+}
+
+# ---- init ----
+modprobe acpi_call 2>/dev/null
+if [ ! -w "$ACPI_CALL" ]; then
+    logger -t clevo-thermald "FATAL: $ACPI_CALL not writable — is acpi_call(-dkms) installed?"
+    echo "FATAL: $ACPI_CALL not writable — install acpi_call-dkms" >&2
+    exit 1
+fi
+# safety: always hand the fans back to the EC firmware curve when we stop/crash
+on_exit() { fans_to_auto; }
+trap on_exit EXIT
+trap 'exit 0' INT TERM
+
+[ "$(cat "$BOOST_PATH" 2>/dev/null)" = "1" ] && boost_state="on" || boost_state="off"
+boost_hi=0; boost_lo=0
+cap_level=0; cap_target=0; cap_dwell=0
+last_cpu_d=-100; last_gpu_d=-100; gpu_temp=""; gpu_poll=999; gpu_fail=0; fan_emerg=0
+declare -a samples=()
+declare -a busy_samples=()
+declare -A culprit_count=()
+read -r prev_idle prev_total < <(read_cpu)
+
+# establish known baseline on startup: full clocks (the fan curve takes over on loop 1)
+temp=$(get_max_temp); temp_c=$((temp / 1000)); avg=$temp
+set_max_freq "${P_MAX_KHZ}kHz"
+
+while true; do
+    sleep 1
+    temp=$(get_max_temp); temp_c=$((temp / 1000))
+
+    # smoothed temperature
+    samples+=("$temp")
+    while [ "${#samples[@]}" -gt "$SMOOTH_SAMPLES" ]; do samples=("${samples[@]:1}"); done
+    sum=0; for s in "${samples[@]}"; do sum=$((sum + s)); done
+    avg=$((sum / ${#samples[@]}))
+
+    # aggregate CPU busy% over the last ~1s
+    read -r cur_idle cur_total < <(read_cpu)
+    d_idle=$((cur_idle - prev_idle)); d_total=$((cur_total - prev_total))
+    prev_idle=$cur_idle; prev_total=$cur_total
+    if [ "$d_total" -gt 0 ]; then busy_raw=$(( (100 * (d_total - d_idle)) / d_total )); else busy_raw=0; fi
+    busy_samples+=("$busy_raw")
+    while [ "${#busy_samples[@]}" -gt "$BUSY_SMOOTH" ]; do busy_samples=("${busy_samples[@]:1}"); done
+    bsum=0; for b in "${busy_samples[@]}"; do bsum=$((bsum + b)); done
+    busy=$((bsum / ${#busy_samples[@]}))
+
+    # attribution: while warm, tally who is the top CPU process each second
+    if [ "$avg" -ge "$ATTRIB_WATCH_TEMP" ]; then
+        read -r ctop_pid ctop_comm < <(ps -eo pid=,comm= --sort=-%cpu 2>/dev/null | head -1)
+        if [ -n "$ctop_comm" ]; then
+            key="${ctop_comm}#${ctop_pid}"
+            culprit_count["$key"]=$(( ${culprit_count["$key"]:-0} + 1 ))
+        fi
+    elif [ "${#culprit_count[@]}" -gt 0 ]; then
+        culprit_count=()
+    fi
+
+    # 1. dynamic boost gating
+    if [ "$boost_state" = "on" ]; then
+        if [ "$busy" -lt "$BOOST_OFF_BUSY" ]; then boost_lo=$((boost_lo + 1)); else boost_lo=0; fi
+        [ "$boost_lo" -ge "$BOOST_OFF_SECONDS" ] && boost_off
+    else
+        if [ "$busy" -gt "$BOOST_ON_BUSY" ]; then boost_hi=$((boost_hi + 1)); else boost_hi=0; fi
+        [ "$boost_hi" -ge "$BOOST_ON_SECONDS" ] && boost_on
+    fi
+
+    # 2. manual fan curves (CPU + GPU)
+    manage_fans
+
+    # 3. load-aware CPU max-clock control (idle & hot -> slow down; load -> full speed)
+    manage_cpu_cap
+done
