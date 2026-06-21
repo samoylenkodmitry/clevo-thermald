@@ -39,7 +39,10 @@ while still ramping to full cooling and full clocks the moment real load arrives
    Linux; the EC runs its own (over-aggressive) curve. Using the reverse-engineered WMI
    `SetFanDuty` command (`0x68`) the daemon drives **its own quiet curves** — CPU fan
    off smoothed `k10temp`, GPU fan off `nvidia-smi` temp — ramping firmly to 100 %
-   before each chip's throttle point. Reverts to the EC's auto curve on exit/crash.
+   before each chip's throttle point. The duty is **slew-limited** so the fan glides
+   instead of revving up and down, a fast **"high" clamp** gives firm cooling before the
+   limit, and the **100 % emergency is debounced** so a single sensor spike can't trigger
+   a slam. Reverts to the EC's auto curve on exit/crash.
 
 3. **Load-aware CPU clock control.** When idle/light the CPU is held at a low P-state
    (no point running max clock when nothing needs it — keeps it cool/quiet); full speed
@@ -99,14 +102,21 @@ Highlights:
 |----------|---------|
 | `CPU_FAN_T` / `CPU_FAN_D` | CPU fan curve: temperature points (°C) → duty (0–255) |
 | `GPU_FAN_T` / `GPU_FAN_D` | GPU fan curve (vs `nvidia-smi` temp) |
-| `CPU_FAN_EMERG` / `GPU_FAN_EMERG` | temps that force that fan to 100 % immediately |
+| `CPU_FAN_HIGH_T` / `_D` · `GPU_FAN_HIGH_T` / `_D` | fast firm duty applied *before* the emergency, to avoid overshoot |
+| `CPU_FAN_EMERG` / `GPU_FAN_EMERG` | temps that force that fan to 100 % |
+| `EMERG_STREAK` | consecutive over-temp samples required before the 100 % slam (filters spikes) |
+| `DUTY_SLEW_UP` / `DUTY_SLEW_DOWN` | max duty change per second (anti-rev; gentle quieting) |
+| `SMOOTH_SAMPLES` | seconds of temperature smoothing (heavier = steadier fan) |
+| `FAN_LOG_EVERY` | rate-limit the routine `fan duty` log line to once per N seconds |
 | `GPU_POLL_SECS` | how often to read GPU temp (`0` = don't manage the GPU fan) |
 | `BOOST_ON_BUSY` / `BOOST_OFF_BUSY` | load thresholds that gate CPU boost |
 | `IDLE_BUSY` | below this busy% the CPU is treated as idle (clocks held low) |
 | `IDLE_HOT` / `IDLE_COOL` / `LOAD_*` | the load-aware clock ladder |
 
-Want it even quieter? Lower the first entries of `*_FAN_D`. Want it cooler/safer? Raise
-them or lower the `*_T` points. The curves are interpolated linearly between points.
+Want it even quieter (accepting higher temps)? Lower the first entries of `*_FAN_D`,
+flatten the mid-curve, raise `SMOOTH_SAMPLES`, and raise `BOOST_ON_BUSY`. Want it
+cooler/safer? Raise the duties or lower the `*_T` points. The curves are interpolated
+linearly between points; `*_FAN_EMERG` must stay at or below your chip's throttle temp.
 
 ## Manual tools
 

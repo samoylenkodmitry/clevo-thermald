@@ -14,61 +14,82 @@
 #   3. CPU P-state control — idle/light holds clocks low for silence; full speed
 #      under load; emergency cap if dangerously hot.
 #
+# Tuned for SILENCE over speed/temps: fan curves are flat & low through the normal
+# band and ramp hard only near each chip's limit; duty is SLEW-limited so the fan
+# glides instead of revving; temps are smoothed heavily and the emergency 100% slam is
+# debounced so a single sensor spike can't trigger it. Hard safety (emergency 100%,
+# EC-auto on exit) is intact. The chip is allowed to run hotter/slower on purpose.
+#
 # Attribution: while warm it tracks which process dominates the CPU, so fan/clock
 # events name the process (with PID) responsible. All thresholds tunable below.
 # Runs as root from clevo-thermald.service.
 
 # ---- CPB boost dynamic gating (by aggregate CPU busy%) ----
 BOOST_PATH=/sys/devices/system/cpu/cpufreq/boost
-BOOST_ON_BUSY=40          # smoothed aggregate busy% sustained -> enable boost
+BOOST_ON_BUSY=50          # smoothed aggregate busy% sustained -> enable boost (higher = quieter)
 BOOST_ON_SECONDS=3
 BOOST_OFF_BUSY=26         # smoothed aggregate busy% sustained below -> disable boost
 BOOST_OFF_SECONDS=8
 
 # ---- manual fan curves (we own the fans; the stock EC over-drives them) ----
-# Curves map temp(C) -> duty(0-255); linear interpolation between points. Quieter than
-# the stock EC, but ramp firmly toward 100% before each chip's throttle point.
+# Curves map temp(C) -> duty(0-255); linear interpolation between points. Tuned for
+# silence: hold a low steady duty across the whole normal band, ramp firmly toward 100%
+# only as each chip nears its throttle point. The machine runs hotter on purpose.
 ACPI_CALL=/proc/acpi/call
-CPU_FAN_T=(60 72 82 88 92 96)     # CPU fan vs smoothed k10temp (quieter idle, firm ramp near Tjmax)
-CPU_FAN_D=(48 76 112 165 215 255)
-GPU_FAN_T=(62 72 78 82 85 88)     # GPU fan vs nvidia-smi temp
-GPU_FAN_D=(52 88 135 180 220 255)
-CPU_FAN_EMERG=95         # raw CPU temp (C) at/above -> CPU fan 100% now
-GPU_FAN_EMERG=87         # GPU temp (C) at/above -> GPU fan 100% now
+CPU_FAN_T=(55 80 88 91 94 96)     # CPU fan vs smoothed k10temp: flat/quiet to ~85C, hard ramp past 88
+CPU_FAN_D=(42 64 120 180 230 255)
+GPU_FAN_T=(60 78 83 85 87 89)     # GPU fan vs nvidia-smi temp: quiet to ~80C, hard ramp past 83
+GPU_FAN_D=(38 72 130 185 235 255)
+# "high" = fast firm response BEFORE the emergency: if raw temp crosses this, jump the fan
+# straight to a firm duty (bypassing the gentle up-slew) so heat never overshoots into the
+# 100% emergency slam. 100% is then reserved for a genuine *_FAN_EMERG.
+CPU_FAN_HIGH_T=91; CPU_FAN_HIGH_D=185
+GPU_FAN_HIGH_T=84; GPU_FAN_HIGH_D=185
+CPU_FAN_EMERG=95         # raw CPU temp (C) at/above -> CPU fan 100% (bypasses slew)
+GPU_FAN_EMERG=87         # GPU temp (C) at/above -> GPU fan 100% (bypasses slew)
+EMERG_STREAK=2           # require this many CONSECUTIVE over-temp samples before the 100% slam
+                         # (filters single-sample sensor spikes; the *_FAN_HIGH clamp already
+                         #  gives a fast firm response, so the chip is covered meanwhile)
 GPU_FAIL_DUTY=200        # GPU fan duty if its temp can't be read (safe-high ~78%)
-DUTY_DELTA=8             # only rewrite the EC when a duty moves by >= this (anti-spam)
+DUTY_DELTA=8             # only rewrite the EC when the slewed duty has moved >= this (anti-spam)
+DUTY_SLEW_UP=20          # max duty step UP per second   (catch rising heat before it overshoots)
+DUTY_SLEW_DOWN=7         # max duty step DOWN per second (gentle quieting, no sudden drops)
 GPU_POLL_SECS=3          # refresh GPU temp via nvidia-smi this often (0 disables GPU fan control)
+FAN_LOG_EVERY=120        # log a 'fan duty' heartbeat at most once per this many seconds
 
 # ---- CPU max-clock control (load-aware, uses smoothed temp) ----
 # Idle/light -> hold clocks low for silence (never full speed when idle); full speed
-# under load. NOTE: with acpi-cpufreq only a few P-states exist; P_MAX is the highest
-# *settable* clock (boost sits above it and is gated separately, see layer 1).
+# under load, eased down sooner when hot (quieter, accepts slower). NOTE: with
+# acpi-cpufreq only a few P-states exist; P_MAX is the highest *settable* clock (boost
+# sits above it and is gated separately, see layer 1).
 P_MAX_KHZ=$(tr ' ' '\n' < /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies | sort -rn | head -1)
 P_MID_KHZ=2800000         # mid P-state
 P_LOW_KHZ=2200000         # low P-state
 IDLE_BUSY=30              # smoothed busy% below this = idle/light -> hold clocks low for silence
-IDLE_HOT=78000            #   idle & smoothed temp >= this -> P_LOW
+IDLE_HOT=74000            #   idle & smoothed temp >= this -> P_LOW (drop sooner: quieter)
 IDLE_COOL=70000           #   idle & smoothed temp <= this -> back up to P_MID
 LOAD_NOTHOT=90000         #   loaded & below this -> full clocks
-LOAD_CAP_MID=96000        #   full -> P_MID
-LOAD_CAP_LOW=98000        #   P_MID -> P_LOW
-LOAD_REL_LOW=95000        #   P_LOW -> P_MID
+LOAD_CAP_MID=93000        #   full -> P_MID (ease down sooner under heat: quieter/slower)
+LOAD_CAP_LOW=96000        #   P_MID -> P_LOW
+LOAD_REL_LOW=92000        #   P_LOW -> P_MID
 CAP_DWELL=3               # seconds a new target must hold before it is applied
 
 # ---- temperature smoothing & attribution ----
-SMOOTH_SAMPLES=5
+SMOOTH_SAMPLES=10         # smooth k10temp over this many seconds (heavier = steadier fan, no rev)
 BUSY_SMOOTH=3             # smooth aggregate busy% over this many seconds for steady boost gating
 ATTRIB_WATCH_TEMP=85000   # only sample per-process culprits when smoothed temp >= this
 
 get_display_user() { who | grep '(:0)' | awk '{print $1}' | head -1; }
 
-notify() {
-    local urgency="$1" title="$2" body="$3" user uid
+notify() {  # $1=urgency $2=title $3=body [$4=dunst stack-tag]
+    local urgency="$1" title="$2" body="$3" tag="${4:-thermal}" user uid to
     user=$(get_display_user)
     uid=$(id -u "$user" 2>/dev/null) || return
+    case "$urgency" in critical) to=0 ;; *) to=8000 ;; esac   # critical persists until dismissed
     runuser -l "$user" -c \
         "DISPLAY=:0.0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus \
-         notify-send -u ${urgency} -t 8000 '${title}' '${body}'" 2>/dev/null &
+         notify-send -a clevo-thermald -u ${urgency} -t ${to} \
+         -h string:x-dunst-stack-tag:${tag} '${title}' '${body}'" 2>/dev/null &
 }
 
 get_max_temp() {
@@ -155,8 +176,15 @@ interp() {  # $1=temp_c, $2=T-array name, $3=D-array name
     echo "${D[n-1]}"
 }
 
+slew() {  # $1=current $2=target -> echoes current moved toward target, clamped per step
+    local cur="$1" tgt="$2" d=$(( $2 - $1 ))
+    if   [ "$d" -gt "$DUTY_SLEW_UP" ];    then echo $(( cur + DUTY_SLEW_UP ))
+    elif [ "$d" -lt "-$DUTY_SLEW_DOWN" ]; then echo $(( cur - DUTY_SLEW_DOWN ))
+    else echo "$tgt"; fi
+}
+
 manage_fans() {
-    local cpu_c=$((avg / 1000)) cpu_raw_c=$((temp / 1000)) cpu_d gpu_d emerg=0
+    local cpu_c=$((avg / 1000)) cpu_raw_c=$((temp / 1000)) cpu_t gpu_t emerg=0
 
     # refresh GPU temp periodically (nvidia-smi is relatively expensive)
     if [ "$GPU_POLL_SECS" -gt 0 ]; then
@@ -168,34 +196,52 @@ manage_fans() {
         fi
     fi
 
-    cpu_d=$(interp "$cpu_c" CPU_FAN_T CPU_FAN_D)
+    # curve targets
+    cpu_t=$(interp "$cpu_c" CPU_FAN_T CPU_FAN_D)
     if [ "$GPU_POLL_SECS" -le 0 ]; then
-        gpu_d=$cpu_d                                  # no GPU control: mirror CPU duty
+        gpu_t=$cpu_t                                  # no GPU control: mirror CPU duty
     elif [ -n "$gpu_temp" ] && [ "$gpu_fail" -lt 3 ]; then
-        gpu_d=$(interp "$gpu_temp" GPU_FAN_T GPU_FAN_D)
+        gpu_t=$(interp "$gpu_temp" GPU_FAN_T GPU_FAN_D)
     else
-        gpu_d=$GPU_FAIL_DUTY
+        gpu_t=$GPU_FAIL_DUTY
     fi
 
-    # emergencies (use raw/live temps, force the affected fan to 100%)
-    if [ "$cpu_raw_c" -ge "$CPU_FAN_EMERG" ]; then cpu_d=255; emerg=1; fi
-    if [ -n "$gpu_temp" ] && [ "$gpu_temp" -ge "$GPU_FAN_EMERG" ]; then gpu_d=255; emerg=1; fi
+    # slew the live duty toward the curve target (no revving)
+    cur_cpu_d=$(slew "$cur_cpu_d" "$cpu_t")
+    cur_gpu_d=$(slew "$cur_gpu_d" "$gpu_t")
 
-    # write only on a meaningful change
-    local dc=$((cpu_d - last_cpu_d)); dc=${dc#-}
-    local dg=$((gpu_d - last_gpu_d)); dg=${dg#-}
+    # fast firm response before the emergency: if raw temp is high, jump straight to a firm
+    # duty (skip the gentle up-slew) so heat can't overshoot into the 100% emergency slam.
+    if [ "$cpu_raw_c" -ge "$CPU_FAN_HIGH_T" ] && [ "$cur_cpu_d" -lt "$CPU_FAN_HIGH_D" ]; then cur_cpu_d=$CPU_FAN_HIGH_D; fi
+    if [ "$GPU_POLL_SECS" -gt 0 ] && [ -n "$gpu_temp" ] && [ "$gpu_temp" -ge "$GPU_FAN_HIGH_T" ] && [ "$cur_gpu_d" -lt "$GPU_FAN_HIGH_D" ]; then cur_gpu_d=$GPU_FAN_HIGH_D; fi
+
+    # emergencies (use raw/live temps; force to 100%, bypass slew). Debounced: a single
+    # transient sensor spike won't trigger the slam — require EMERG_STREAK in a row.
+    if [ "$cpu_raw_c" -ge "$CPU_FAN_EMERG" ]; then cpu_emerg_n=$((cpu_emerg_n + 1)); else cpu_emerg_n=0; fi
+    if [ "$GPU_POLL_SECS" -gt 0 ] && [ -n "$gpu_temp" ] && [ "$gpu_temp" -ge "$GPU_FAN_EMERG" ]; then gpu_emerg_n=$((gpu_emerg_n + 1)); else gpu_emerg_n=0; fi
+    if [ "$cpu_emerg_n" -ge "$EMERG_STREAK" ]; then cur_cpu_d=255; emerg=1; fi
+    if [ "$gpu_emerg_n" -ge "$EMERG_STREAK" ]; then cur_gpu_d=255; emerg=1; fi
+
+    # write to the EC only when the slewed duty has drifted meaningfully from what we wrote
+    local dc=$((cur_cpu_d - last_cpu_d)); dc=${dc#-}
+    local dg=$((cur_gpu_d - last_gpu_d)); dg=${dg#-}
     if [ "$dc" -ge "$DUTY_DELTA" ] || [ "$dg" -ge "$DUTY_DELTA" ] || { [ "$emerg" = 1 ] && [ "$fan_emerg" = 0 ]; }; then
-        set_fan_duty "$cpu_d" "$gpu_d"
-        last_cpu_d=$cpu_d; last_gpu_d=$gpu_d
-        logger -t clevo-thermald "fan duty: CPU $((cpu_d * 100 / 255))% (${cpu_raw_c}C) / GPU $((gpu_d * 100 / 255))% (${gpu_temp:-?}C)"
+        set_fan_duty "$cur_cpu_d" "$cur_gpu_d"
+        last_cpu_d=$cur_cpu_d; last_gpu_d=$cur_gpu_d
+        # rate-limited heartbeat log (avoid burying real events under thousands of these)
+        if [ "$emerg" = 1 ] || [ $((tick - last_fan_log)) -ge "$FAN_LOG_EVERY" ]; then
+            last_fan_log=$tick
+            logger -t clevo-thermald "fan duty: CPU $((cur_cpu_d * 100 / 255))% (${cpu_raw_c}C) / GPU $((cur_gpu_d * 100 / 255))% (${gpu_temp:-?}C)"
+        fi
     fi
 
-    # one-shot emergency notification with culprit
+    # one-shot emergency notification with culprit (critical = persists; stack tag = no pile-up)
     if [ "$emerg" = 1 ] && [ "$fan_emerg" = 0 ]; then
         fan_emerg=1
-        notify "critical" "Fan 100% — CPU ${cpu_raw_c}C / GPU ${gpu_temp:-?}C" "Heat source: $(get_culprit)"
+        notify "critical" "Fan 100% — CPU ${cpu_raw_c}C / GPU ${gpu_temp:-?}C" "Heat source: $(get_culprit)" thermal-fan
     elif [ "$emerg" = 0 ] && [ "$fan_emerg" = 1 ]; then
         fan_emerg=0
+        notify "low" "Fans back to curve — CPU ${cpu_raw_c}C / GPU ${gpu_temp:-?}C" "Emergency cleared." thermal-fan
     fi
 }
 
@@ -215,7 +261,17 @@ apply_cap() {  # 0=full, 1=mid, 2=low
     [ "$busy" -lt "$IDLE_BUSY" ] && mode="idle" || mode="load"
     cap_level="$lvl"; cap_target="$lvl"; cap_dwell=0
     logger -t clevo-thermald "CPU clock ${label} (${mode}, busy ${busy}%, ${temp_c}C); heat source: $(get_culprit)"
-    [ "$lvl" -ne 0 ] && notify "normal" "CPU ${label} — ${temp_c}C" "${mode} & hot; heat source: $(get_culprit)"
+
+    # Notify ONLY on genuine load throttling (not routine idle holds), so useful alerts
+    # aren't lost in noise. Critical + stack tag: stays up, coalesces into one bubble.
+    if [ "$mode" = load ] && [ "$lvl" -eq 2 ]; then
+        clock_notified=1
+        notify "critical" "CPU throttled to ${ghz}GHz — ${temp_c}C" \
+               "Sustained load & hot. Heat source: $(get_culprit)" thermal-clock
+    elif [ "$lvl" -eq 0 ] && [ "$clock_notified" = 1 ]; then
+        clock_notified=0
+        notify "low" "CPU back to full speed — ${temp_c}C" "Cooled off." thermal-clock
+    fi
 }
 
 manage_cpu_cap() {
@@ -259,8 +315,11 @@ trap 'exit 0' INT TERM
 
 [ "$(cat "$BOOST_PATH" 2>/dev/null)" = "1" ] && boost_state="on" || boost_state="off"
 boost_hi=0; boost_lo=0
-cap_level=0; cap_target=0; cap_dwell=0
+cap_level=0; cap_target=0; cap_dwell=0; clock_notified=0
 last_cpu_d=-100; last_gpu_d=-100; gpu_temp=""; gpu_poll=999; gpu_fail=0; fan_emerg=0
+cpu_emerg_n=0; gpu_emerg_n=0
+tick=0; last_fan_log=-100000
+cur_cpu_d=${CPU_FAN_D[0]}; cur_gpu_d=${GPU_FAN_D[0]}   # start fans at the quiet floor, slew up if needed
 declare -a samples=()
 declare -a busy_samples=()
 declare -A culprit_count=()
@@ -272,6 +331,7 @@ set_max_freq "${P_MAX_KHZ}kHz"
 
 while true; do
     sleep 1
+    tick=$((tick + 1))
     temp=$(get_max_temp); temp_c=$((temp / 1000))
 
     # smoothed temperature
