@@ -36,16 +36,18 @@ BOOST_OFF_SECONDS=8
 # silence: hold a low steady duty across the whole normal band, ramp firmly toward 100%
 # only as each chip nears its throttle point. The machine runs hotter on purpose.
 ACPI_CALL=/proc/acpi/call
-CPU_FAN_T=(55 80 88 91 94 96)     # CPU fan vs smoothed k10temp: flat/quiet to ~85C, hard ramp past 88
-CPU_FAN_D=(42 64 120 180 230 255)
+CPU_FAN_T=(55 85 93 96 98 99)     # CPU fan vs smoothed k10temp: quiet to ~93C, loud only past 96
+CPU_FAN_D=(42 70 130 190 235 255) #   (lets the chip sit near its throttle point for silence)
 GPU_FAN_T=(60 78 83 85 87 89)     # GPU fan vs nvidia-smi temp: quiet to ~80C, hard ramp past 83
 GPU_FAN_D=(38 72 130 185 235 255)
 # "high" = fast firm response BEFORE the emergency: if raw temp crosses this, jump the fan
 # straight to a firm duty (bypassing the gentle up-slew) so heat never overshoots into the
 # 100% emergency slam. 100% is then reserved for a genuine *_FAN_EMERG.
-CPU_FAN_HIGH_T=91; CPU_FAN_HIGH_D=185
+CPU_FAN_HIGH_T=96; CPU_FAN_HIGH_D=190
 GPU_FAN_HIGH_T=84; GPU_FAN_HIGH_D=185
-CPU_FAN_EMERG=95         # raw CPU temp (C) at/above -> CPU fan 100% (bypasses slew)
+CPU_FAN_EMERG=98         # raw CPU temp (C) at/above -> CPU fan 100% (bypasses slew)
+                         # NOTE: keep *_FAN_EMERG at/below the chip's own throttle (Tjmax) ceiling.
+                         # This value runs the chip hot on purpose; lower it for a cooler/louder box.
 GPU_FAN_EMERG=87         # GPU temp (C) at/above -> GPU fan 100% (bypasses slew)
 EMERG_STREAK=2           # require this many CONSECUTIVE over-temp samples before the 100% slam
                          # (filters single-sample sensor spikes; the *_FAN_HIGH clamp already
